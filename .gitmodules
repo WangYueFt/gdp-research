@@ -1,0 +1,9 @@
+[submodule "dcp"]
+	path = dcp
+	url = https://github.com/WangYueFt/dcp
+[submodule "dgcnn"]
+	path = dgcnn
+	url = https://github.com/WangYueFt/dgcnn
+[submodule "prnet"]
+	path = prnet
+	url = https://github.com/WangYueFt/prnet
