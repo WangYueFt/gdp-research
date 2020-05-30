@@ -11,8 +11,8 @@ import tensorflow.compat.v2 as tf
 
 tf.enable_v2_behavior()
 
-
-def augment(points_xyz, points_mask, bboxes):
+def augment(points_xyz, points_mask, bboxes, all_points_xyz,
+            all_points_xyz_transformed, all_points_mask):
   """data augmentation."""
   rand = tf.random.uniform([],
                            minval=-1.0,
@@ -20,14 +20,23 @@ def augment(points_xyz, points_mask, bboxes):
                            dtype=tf.dtypes.float32)
   rand = tf.where(rand > 0, 1, -1)
   rand = tf.cast(rand, tf.dtypes.float32)
-  points_xyz = tf.concat([points_xyz[:, 0:1],
-                          points_xyz[:, 1:2] * rand,
-                          points_xyz[:, 2:]],
+  points_xyz = tf.concat([points_xyz[..., 0:1],
+                          points_xyz[..., 1:2] * rand,
+                          points_xyz[..., 2:]],
                          axis=-1)
-  bboxes = tf.concat([bboxes[:, 0:1],
-                      bboxes[:, 1:2] * rand,
-                      bboxes[:, 2:6],
-                      bboxes[:, 6:] * rand],
+  all_points_xyz = tf.concat([all_points_xyz[..., 0:1],
+                              all_points_xyz[..., 1:2] * rand,
+                              all_points_xyz[..., 2:]],
+                             axis=-1)
+  all_points_xyz_transformed = tf.concat(
+      [all_points_xyz_transformed[..., 0:1],
+       all_points_xyz_transformed[..., 1:2] * rand,
+       all_points_xyz_transformed[..., 2:]],
+      axis=-1)
+  bboxes = tf.concat([bboxes[..., 0:1],
+                      bboxes[..., 1:2] * rand,
+                      bboxes[..., 2:6],
+                      bboxes[..., 6:] * rand],
                      axis=-1)
   theta = tf.random.uniform([],
                             minval=-1,
@@ -38,14 +47,23 @@ def augment(points_xyz, points_mask, bboxes):
                  0, 0, 1])
   rz = tf.reshape(rz, [3, 3])
   points_xyz = tf.matmul(points_xyz, rz)
+  all_points_xyz = tf.matmul(all_points_xyz, tf.expand_dims(rz, axis=0))
+  all_points_xyz_transformed = tf.matmul(all_points_xyz_transformed,
+                                         tf.expand_dims(rz, axis=0))
   theta = tf.reshape(theta, [1, 1])
   bboxes = tf.concat(
-      [tf.matmul(bboxes[:, 0:3], rz),
-       bboxes[:, 3:6],
-       tf_util.wrap_angle_rad(bboxes[:, 6:] + theta, -np.pi, np.pi)], axis=-1)
+      [tf.matmul(bboxes[..., 0:3], rz),
+       bboxes[..., 3:6],
+       tf_util.wrap_angle_rad(bboxes[..., 6:] + theta, -np.pi, np.pi)], axis=-1)
   jitter = tf.random.normal(points_xyz.shape, 0.0, 0.02)
   points_xyz = points_xyz + jitter
-  return points_xyz, points_mask, bboxes
+  jitter = tf.random.normal(all_points_xyz.shape, 0.0, 0.02)
+  all_points_xyz = all_points_xyz + jitter
+  jitter = tf.random.normal(all_points_xyz_transformed.shape, 0.0, 0.02)
+  all_points_xyz_transformed = all_points_xyz_transformed + jitter
+
+  return (points_xyz, points_mask, bboxes, all_points_xyz,
+          all_points_xyz_transformed, all_points_mask)
 
 
 def add_points_bboxes(points_xyz, bboxes, bboxes_label, bboxes_mask,
@@ -185,31 +203,29 @@ def decode_fn(value, data_aug=False,
               class_id=1, difficulty=1, pillar_map_size=(256, 256),
               pillar_map_range=(75.2, 75.2)):
   """Decode function."""
-
   tensor_dict = waymo_decoder.decode_tf_example(
       serialized_example=value,
       features=waymo_decoder.FEATURE_SPEC)
+  frame_valid = tensor_dict['frame_valid']
 
   points_xyz = tensor_dict['lidars']['points_xyz']
   points_feature = tensor_dict['lidars']['points_feature']
-  points_nlz = tensor_dict['lidars']['points_nlz']
+  points_mask = tensor_dict['lidars']['points_mask']
+
+  all_points_xyz = tensor_dict['lidars']['all_points_xyz']
+  all_points_xyz_transformed = (
+      tensor_dict['lidars']['all_points_xyz_transformed'])
+  all_points_feature = tensor_dict['lidars']['all_points_feature']
+  all_points_mask = tensor_dict['lidars']['all_points_mask']
 
   bboxes = tensor_dict['objects']['box']
   bboxes_label = tensor_dict['objects']['label']
   bboxes_speed = tensor_dict['objects']['speed']
   bboxes_difficulty = tensor_dict['objects']['combined_difficulty_level']
+  bboxes_detection_difficulty = (
+      tensor_dict['objects']['combined_difficulty_level'])
 
-  num_valid_points = tf_util.get_shape(points_xyz)[0]
-  points_xyz = tf_util.pad_or_trim_to(points_xyz, [max_num_points, 3])
-  points_feature = tf_util.pad_or_trim_to(points_feature, [max_num_points, 2])
-  points_nlz = tf_util.pad_or_trim_to(points_nlz, [max_num_points])
-
-  points_mask = tf.sequence_mask(num_valid_points,
-                                 maxlen=max_num_points)
-  points_nlz = tf.cast(points_nlz, dtype=tf.dtypes.bool)
-  points_mask = tf.cast(points_mask, dtype=tf.dtypes.float32)
-
-  bboxes_difficulty = tf.equal(bboxes_difficulty, difficulty)
+  bboxes_difficulty = bboxes_difficulty <= difficulty
   bboxes_mask = tf.equal(bboxes_label, class_id)
   bboxes_mask = tf.math.logical_and(bboxes_mask, bboxes_difficulty)
   bboxes_mask = tf.cast(bboxes_mask, dtype=tf.dtypes.float32)
@@ -230,11 +246,14 @@ def decode_fn(value, data_aug=False,
   bboxes_mask = tf_util.pad_or_trim_to(bboxes_mask, [max_num_bboxes])
 
   if data_aug:
-    points_xyz, points_mask, bboxes = augment(
-
-        points_xyz=points_xyz,
-        points_mask=points_mask,
-        bboxes=bboxes)
+    (points_xyz, points_mask, bboxes, all_points_xyz,
+     all_points_xyz_transformed, all_points_mask) = augment(
+         points_xyz=points_xyz,
+         points_mask=points_mask,
+         bboxes=bboxes,
+         all_points_xyz=all_points_xyz,
+         all_points_xyz_transformed=all_points_xyz_transformed,
+         all_points_mask=all_points_mask)
 
   (pillar_map_xyz, pillar_map_bboxes, pillar_map_bboxes_label,
    pillar_map_if_in_bboxes, pillar_map_centerness, pillar_map_bboxes_index) = (
@@ -251,6 +270,16 @@ def decode_fn(value, data_aug=False,
   pillar_map_if_in_bboxes = tf.reshape(pillar_map_if_in_bboxes, [-1])
   pillar_map_centerness = tf.reshape(pillar_map_centerness, [-1])
   pillar_map_bboxes_index = tf.reshape(pillar_map_bboxes_index, [-1])
+
+  all_points_mask = tf.expand_dims(all_points_mask, axis=-1)
+
+  all_points = tf.concat([all_points_xyz,
+                          all_points_xyz_transformed,
+                          all_points_feature,
+                          all_points_mask], axis=-1)
+
+  num_frames, num_points, num_features = tf_util.get_shape(all_points)
+  all_points = tf.reshape(all_points, [num_frames * num_points, num_features])
 
   return {
       'points_xyz': points_xyz,

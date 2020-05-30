@@ -395,3 +395,164 @@ def compute_ap(decoded_outputs, class_id):
       pred_bbox, pred_class_id, pred_class_score, pred_frame_id,
       gt_bbox, gt_class_id, gt_frame_id, gt_bbox_speed, box_type='2d')
   return scalar_metrics_3d, scalar_metrics_2d
+
+
+def transform_points_with_transform(points_xyz, transform):
+  points = tf.concat([points_xyz, tf.ones_like(points_xyz[..., :1])], axis=-1)
+  points = tf.matmul(points, transform, transpose_b=True)
+  points_xyz = points[..., :3] / points[..., 3:]
+  return points_xyz
+
+
+def transform_frame_with_transform(
+    points_xyz, bboxes, source_frame_pose, target_frame_pose):
+  """Transform from source frame to target frame."""
+  transform = tf.matmul(tf.linalg.inv(target_frame_pose), source_frame_pose)
+  points_xyz = transform_points_with_transform(points_xyz, transform)
+
+  def transform_box(bboxes, transform):
+    """Transform bboxes."""
+    center_xyz = bboxes[..., :3]
+    dimensions = bboxes[..., 3:6]
+    rot = bboxes[..., 6:]
+
+    center_xyz = transform_points_with_transform(center_xyz, transform)
+
+    rot += tf.atan2(transform[..., 1:2, 0:1], transform[..., 0:1, 0:1])
+    rot = wrap_angle_rad(rot)
+
+    bboxes = tf.concat([center_xyz, dimensions, rot], axis=-1)
+    return bboxes
+
+  num_bboxes = get_shape(bboxes)[0]
+  bboxes = tf.cond(num_bboxes > 0,
+                   lambda: transform_box(bboxes, transform), lambda: bboxes)
+
+  return points_xyz, bboxes
+
+
+def batch_move_points_and_bboxes(points_xyz, bboxes, bboxes_mask,
+                                 target_bboxes):
+  """Transform points to target positions if they are in bounding boxes."""
+  one_bbox = tf.ones([1, 7], dtype=tf.dtypes.float32)
+  one_bbox_mask = tf.zeros([1], dtype=tf.dtypes.float32)
+
+  bboxes = tf.concat([bboxes, one_bbox], axis=0)
+  target_bboxes = tf.concat([target_bboxes, one_bbox], axis=0)
+  bboxes_mask = tf.concat([bboxes_mask, one_bbox_mask], axis=0)
+
+  theta = bboxes[..., 6]
+  rz = tf.stack(
+      [tf.cos(theta), -tf.sin(theta), tf.zeros_like(theta),
+       tf.sin(theta), tf.cos(theta), tf.zeros_like(theta),
+       tf.zeros_like(theta), tf.zeros_like(theta), tf.ones_like(theta)],
+      axis=-1)
+  # b, m, 3, 3
+  rz = tf.reshape(rz, get_shape(rz)[:-1] + [3, 3])
+
+  # b, n, m, 3
+  points_xyz_in_bbox_frame = (tf.expand_dims(points_xyz, axis=-2) -
+                              tf.expand_dims(bboxes[..., 0:3], axis=-3))
+  # points_xyz -> (b, n, m, 1, 3) * (b, 1, m, 3, 3) -> (b, n, m, 1, 3)
+  points_xyz_in_bbox_frame = tf.expand_dims(points_xyz_in_bbox_frame, axis=-2)
+  rz = tf.expand_dims(rz, axis=0)
+
+  # (b, n, m, 3)
+  points_xyz_in_bbox_frame = tf.squeeze(tf.matmul(points_xyz_in_bbox_frame, rz),
+                                        axis=-2)
+
+  # (b, 1, m, 3)
+  bboxes_size_min = tf.expand_dims(-bboxes[..., 3:6] / 2, axis=0)
+  bboxes_size_max = tf.expand_dims(bboxes[..., 3:6] / 2, axis=0)
+
+  # (b, n, m)
+  points_if_in_bboxes = tf.reduce_all(
+      (points_xyz_in_bbox_frame >= bboxes_size_min) &
+      (points_xyz_in_bbox_frame <= bboxes_size_max), axis=-1)
+
+  points_if_in_bboxes = tf.cast(points_if_in_bboxes, tf.dtypes.float32)
+
+  # b, n, m
+  points_if_in_bboxes = points_if_in_bboxes * tf.expand_dims(bboxes_mask,
+                                                             axis=0)
+
+  # b, n
+  points_bboxes_index = tf.argmax(points_if_in_bboxes, axis=-1)
+
+  # b, n
+  points_if_in_bboxes = tf.gather(
+      points_if_in_bboxes,
+      points_bboxes_index,
+      batch_dims=len(get_shape(points_xyz))-1)
+
+  target_theta = target_bboxes[..., 6]
+  target_rz = tf.stack(
+      [tf.cos(target_theta), -tf.sin(target_theta), tf.zeros_like(target_theta),
+       tf.sin(target_theta), tf.cos(target_theta), tf.zeros_like(target_theta),
+       tf.zeros_like(target_theta), tf.zeros_like(target_theta),
+       tf.ones_like(target_theta)],
+      axis=-1)
+  # b, m, 3, 3
+  target_rz = tf.reshape(target_rz, get_shape(target_rz)[:-1] + [3, 3])
+  # b, 1, m, 3, 3
+  target_rz = tf.expand_dims(target_rz, axis=0)
+  # b, n, m, 1, 3
+  points_xyz_in_bbox_frame = tf.expand_dims(points_xyz_in_bbox_frame, axis=-2)
+  # points_xyz -> (b, n, m, 1, 3) * (b, 1, m, 3, 3) -> (b, n, m, 3)
+  target_points_xyz = tf.squeeze(tf.matmul(points_xyz_in_bbox_frame, target_rz,
+                                           transpose_b=True),
+                                 axis=-2)
+  # target_bboxes: b, m, 3
+  target_points_xyz = target_points_xyz + tf.expand_dims(target_bboxes[..., :3],
+                                                         axis=0)
+  target_points_xyz = tf.gather(target_points_xyz,
+                                points_bboxes_index,
+                                batch_dims=len(get_shape(points_xyz))-1)
+  target_points_xyz = tf.where(
+      tf.expand_dims(points_if_in_bboxes, axis=-1) > 0.0,
+      target_points_xyz,
+      points_xyz)
+  return target_points_xyz
+
+
+def transform_points_per_box(
+    points_xyz,
+    prev_bboxes,
+    prev_bboxes_id,
+    prev_frame_pose,
+    current_bboxes,
+    current_bboxes_id,
+    current_frame_pose):
+  """Transform points per box."""
+  points_xyz, prev_bboxes = transform_frame_with_transform(
+      points_xyz, prev_bboxes, prev_frame_pose, current_frame_pose)
+
+  if tf.rank(prev_bboxes) < 2 or tf.rank(current_bboxes) < 2:
+    return points_xyz, points_xyz
+
+  else:
+    one_bbox = tf.zeros([1, 7], current_bboxes.dtype)
+    current_bboxes = tf.cond(
+        tf.rank(current_bboxes) > 1,
+        lambda: tf.concat([one_bbox, current_bboxes], axis=0),
+        lambda: one_bbox)
+
+    table = tf.range(1, get_shape(current_bboxes)[0], 1)
+
+    current_bboxes_id_expanded = tf.expand_dims(current_bboxes_id, 0)
+    prev_bboxes_id = tf.expand_dims(prev_bboxes_id, 1)
+    target_bboxes_id = tf.where(
+        tf.equal(prev_bboxes_id, current_bboxes_id_expanded),
+        tf.expand_dims(table, 0),
+        tf.zeros_like(tf.expand_dims(table, 0)))
+
+    target_bboxes_id = tf.concat([
+        tf.zeros(get_shape(target_bboxes_id)[0:1] + [1],
+                 target_bboxes_id.dtype),
+        target_bboxes_id], axis=-1)
+    target_bboxes_id = tf.reduce_max(target_bboxes_id, axis=1)
+    prev_bboxes_mask = tf.cast(target_bboxes_id > 0, tf.dtypes.float32)
+    target_bboxes = tf.gather(current_bboxes, target_bboxes_id)
+    points_xyz_transformed = batch_move_points_and_bboxes(
+        points_xyz, prev_bboxes, prev_bboxes_mask, target_bboxes)
+    return points_xyz, points_xyz_transformed

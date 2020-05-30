@@ -13,8 +13,10 @@ import tensorflow_datasets as tfds
 from waymo_open_dataset import dataset_pb2
 from waymo_open_dataset.utils import range_image_utils
 from waymo_open_dataset.utils import transform_utils
-tf.enable_v2_behavior()
 
+from google3.experimental.users.vayuewang.pillar import tf_util
+
+tf.enable_v2_behavior()
 
 OBJECT_SPEC = tfds.features.FeaturesDict({
     'id': tf.int64,
@@ -38,15 +40,32 @@ OBJECT_SPEC = tfds.features.FeaturesDict({
 FEATURE_SPEC = tfds.features.FeaturesDict({
     'scene_name': tfds.features.Text(),
     'frame_name': tfds.features.Text(),
+    'timestamp_micros': tf.int64,
     'lidars': {
         'points_xyz':
-            tfds.features.Tensor(shape=(None, 3), dtype=tf.float32),
+            tfds.features.Tensor(shape=(245760, 3), dtype=tf.float32),
         'points_feature':
-            tfds.features.Tensor(shape=(None, 2), dtype=tf.float32),
-        'points_nlz':
-            tfds.features.Tensor(shape=(None,), dtype=tf.float32),
+            tfds.features.Tensor(shape=(245760, 2), dtype=tf.float32),
+        'points_mask':
+            tfds.features.Tensor(shape=(245760,), dtype=tf.float32),
+        'all_points_xyz':
+            tfds.features.Tensor(shape=(5, 245760, 3), dtype=tf.float32),
+        'all_points_xyz_transformed':
+            tfds.features.Tensor(shape=(5, 245760, 3), dtype=tf.float32),
+        'all_points_feature':
+            tfds.features.Tensor(shape=(5, 245760, 2), dtype=tf.float32),
+        'all_points_mask':
+            tfds.features.Tensor(shape=(5, 245760,), dtype=tf.float32),
     },
     'objects': tfds.features.Sequence(OBJECT_SPEC),
+    'frame_pose': tfds.features.Tensor(shape=(4, 4), dtype=tf.float32),
+    'frame_valid': tfds.features.Tensor(shape=(5,), dtype=tf.int32),
+})
+
+# Sequence specification of waymo open dataset.
+SEQUENCE_SPEC = tfds.features.FeaturesDict({
+    'scene_name': tfds.features.Text(),
+    'frames': tfds.features.Sequence(FEATURE_SPEC),
 })
 
 
@@ -83,11 +102,89 @@ def decode_frame(frame):
 
   example_data = {
       'scene_name': frame.context.name,
+      'timestamp_micros': frame.timestamp_micros,
       'frame_name': frame_name,
       'lidars': lidars,
       'objects': objects,
+      'frame_pose': np.reshape(np.asarray(frame.pose.transform),
+                               [4, 4]).astype('float32'),
   }
-  return encode_tf_example(example_data, FEATURE_SPEC)
+  return frame.context.name, example_data
+  # return encode(example_data)
+
+
+def encode(item):
+  return encode_tf_example(item, FEATURE_SPEC)
+
+
+def transform_frame(item):
+  """Transform and aggregate frames."""
+  _, value = item
+  frames = sorted(value, key=lambda x: x['timestamp_micros'])
+
+  for idx, frame in enumerate(frames):
+    points_xyz = tf.convert_to_tensor(frame['lidars']['points_xyz'])
+    points_feature = tf.convert_to_tensor(frame['lidars']['points_feature'])
+    points_mask = tf.convert_to_tensor(frame['lidars']['points_mask'])
+    bboxes = tf.convert_to_tensor([x['box'] for x in frame['objects']])
+    frame_pose = tf.convert_to_tensor(frame['frame_pose'])
+    bboxes_id = tf.convert_to_tensor([x['name'] for x in frame['objects']])
+    all_points_xyz = []
+    all_points_xyz_transformed = []
+    all_points_feature = []
+    all_points_mask = []
+    frame_valid = []
+    for diff in range(-4, 0, 1):
+      if idx + diff < 0:
+        prev_points_xyz = tf.zeros_like(points_xyz)
+        prev_points_feature = tf.zeros_like(points_feature)
+        prev_points_mask = tf.zeros_like(points_mask)
+        prev_points_xyz_transformed = tf.zeros_like(points_xyz)
+        is_valid = 0
+      else:
+        prev_points_xyz = tf.convert_to_tensor(
+            frames[idx+diff]['lidars']['points_xyz'])
+        prev_points_feature = tf.convert_to_tensor(
+            frames[idx+diff]['lidars']['points_feature'])
+        prev_points_mask = tf.convert_to_tensor(
+            frames[idx+diff]['lidars']['points_mask'])
+        prev_bboxes = tf.convert_to_tensor(
+            [x['box'] for x in frames[idx+diff]['objects']])
+        prev_frame_pose = tf.convert_to_tensor(frames[idx+diff]['frame_pose'])
+        prev_bboxes_id = tf.convert_to_tensor(
+            [x['name'] for x in frames[idx+diff]['objects']])
+        prev_points_xyz, prev_points_xyz_transformed = (
+            tf_util.transform_points_per_box(
+                prev_points_xyz, prev_bboxes,
+                prev_bboxes_id, prev_frame_pose,
+                bboxes, bboxes_id, frame_pose))
+        is_valid = 1
+      all_points_xyz.append(prev_points_xyz)
+      all_points_xyz_transformed.append(prev_points_xyz_transformed)
+      all_points_feature.append(prev_points_feature)
+      all_points_mask.append(prev_points_mask)
+      frame_valid.append(is_valid)
+
+    all_points_xyz.append(points_xyz)
+    all_points_xyz_transformed.append(points_xyz)
+    all_points_feature.append(points_feature)
+    all_points_mask.append(points_mask)
+    frame_valid.append(1)
+    frame_valid = np.asarray(frame_valid)
+
+    all_points_xyz = tf.stack(all_points_xyz, axis=0)
+    all_points_xyz_transformed = tf.stack(all_points_xyz_transformed, axis=0)
+    all_points_feature = tf.stack(all_points_feature, axis=0)
+    all_points_mask = tf.stack(all_points_mask, axis=0)
+    frame['lidars']['all_points_xyz'] = all_points_xyz.numpy().astype('float32')
+    frame['lidars']['all_points_xyz_transformed'] = (
+        all_points_xyz_transformed.numpy().astype('float32'))
+    frame['lidars']['all_points_feature'] = (
+        all_points_feature.numpy().astype('float32'))
+    frame['lidars']['all_points_mask'] = (
+        all_points_mask.numpy().astype('float32'))
+    frame['frame_valid'] = frame_valid.astype('int32')
+  return [encode_tf_example(frame, FEATURE_SPEC) for frame in frames]
 
 
 def extract_points_from_range_image(laser, calibration, frame_pose):
@@ -150,11 +247,14 @@ def extract_points_from_range_image(laser, calibration, frame_pose):
         tf.concat([range_image_cartesian, range_image_tensor[..., 1:4]],
                   axis=-1),
         tf.where(range_image_mask))
-    points_list.append(points_tensor.numpy())
+    points_list.append(points_tensor)
   return points_list
 
 
-def extract_points(lasers, laser_calibrations, frame_pose):
+def extract_points(lasers,
+                   laser_calibrations,
+                   frame_pose,
+                   max_num_points=245760):
   """Extract point clouds."""
   sort_lambda = lambda x: x.name
   lasers_with_calibration = zip(
@@ -162,18 +262,24 @@ def extract_points(lasers, laser_calibrations, frame_pose):
       sorted(laser_calibrations, key=sort_lambda))
   points_xyz = []
   points_feature = []
-  points_nlz = []
   for laser, calibration in lasers_with_calibration:
     points_list = extract_points_from_range_image(laser, calibration,
                                                   frame_pose)
-    points = np.concatenate(points_list, axis=0)
-    points_xyz.extend(points[..., :3].astype(np.float32))
-    points_feature.extend(points[..., 3:5].astype(np.float32))
-    points_nlz.extend(points[..., 5].astype(np.float32))
+    points = tf.concat(points_list, axis=0)
+    points_xyz.append(points[..., :3])
+    points_feature.append(points[..., 3:5])
+  points_xyz = tf.concat(points_xyz, axis=0)
+  points_feature = tf.concat(points_feature, axis=0)
+  num_valid_points = tf_util.get_shape(points_xyz)[0]
+  points_mask = tf.sequence_mask(num_valid_points,
+                                 maxlen=max_num_points)
+  points_mask = tf.cast(points_mask, dtype=tf.dtypes.float32)
+  points_xyz = tf_util.pad_or_trim_to(points_xyz, [max_num_points, 3])
+  points_feature = tf_util.pad_or_trim_to(points_feature, [max_num_points, 2])
   return {
-      'points_xyz': np.asarray(points_xyz),
-      'points_feature': np.asarray(points_feature),
-      'points_nlz': np.asarray(points_nlz),
+      'points_xyz': points_xyz.numpy().astype('float32'),
+      'points_feature': points_feature.numpy().astype('float32'),
+      'points_mask': points_mask.numpy().astype('float32'),
   }
 
 

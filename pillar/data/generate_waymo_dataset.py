@@ -7,7 +7,10 @@ from __future__ import print_function
 from absl import app
 from absl import flags
 import apache_beam as beam
-from pillar.data import waymo_decoderfrom waymo_open_dataset import dataset_pb2
+from pillar.data import waymo_decoder
+import tensorflow.compat.v2 as tf
+
+from waymo_open_dataset import dataset_pb2
 
 tf.enable_v2_behavior()
 
